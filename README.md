@@ -11,7 +11,7 @@ Clipper2 的 WASM 版本做实体轮廓布尔求交（局部干涉），IndexedD
 npm install
 npm run dev        # 开发服务器
 npm run build      # 类型检查 + 生产构建（dist/，可直接静态托管）
-npm test           # 解析尺寸 / 齿形闭合 / 啮合相位 / 导入导出往返 的数值核对
+npm test           # 尺寸/齿形/啮合相位数值核对 + 修订往返 + 修订工作流验收（含 IndexedDB 模拟）
 ```
 
 ## 模型适用范围（重要）
@@ -63,18 +63,63 @@ dφ1/ds = +1/r_b1,  dφ2/ds = −1/r_b2
 - 参考圆（节圆/基圆/齿顶/齿根）、理论啮合线（灰）与实际啮合段（绿）、节点、接触点可切换；
 - **单位切换** mm/cm/m/in 只改显示换算，内部始终存 mm，实际尺寸不变；
 - 中心距、啮合角 α′、节圆、侧隙、顶隙、重合度 ε_α、基节一致性、根切/变尖检查实时显示；
-- **案例**：IndexedDB 本地保存/载入；可导出自描述 JSON（可勾选附带轮廓多边形），
-  导出文件可重新导入，且随载轮廓可直接用于 Clipper 求交（`check-roundtrip.ts` 验证）。
+
+### 不可变"设计修订与合并"工作流（schema v2）
+
+每次"保存修订"都生成一条**不可变**记录，而不是覆盖旧案例。修订包含：
+
+- `parentDigest` 父修订内容指纹，串成可回溯的修订 DAG（根修订为 null）；
+- **参数快照**（z/m/α/b/中心距/单位）；
+- **轮廓指纹**：对由参数确定性生成的两份轮廓多边形取 cyrb128 哈希；
+- **检查摘要**：两轮尺寸、a₀/a、α′、节圆、侧隙、顶隙、重合度、基节差、警告，
+  以及保存时当前帧的 Clipper 干涉面积（含轮廓的修订）；
+- 备注、创建时间、标签页实例（creator）。
+
+由此提供：
+
+- **版本恢复**：任一历史版可一键恢复到工作台，原几何不变（轮廓由参数确定性重建，
+  且 `OUTLINE_INVOLUTE_STEPS=16` 固定离散化使指纹跨版本稳定）；再保存即从该版长出后继；
+- **分叉新实验**：从任一历史版"分叉"会另建实验线（项目），项目元数据记录 fork 来源；
+- **两版比较**：并排表格比较尺寸、中心距、节圆、侧隙等 Δ(B−A)，显示保存时帧干涉，
+  还可在【同一个当前帧】对两版各重放一次 Clipper 求交，直接看干涉面积差；
+- **并发分支不丢**：两个标签页（或两次导入）基于同一父版保存不同后继时，
+  IndexedDB 事务串行化保证双方都落库，图算法标出分叉点与并列 head，不做最后写入者覆盖；
+- **冲突双存**：持久层以内容指纹 `digest` 为主键。重复导入同一修订**幂等去重**不产生副本；
+  同一 `revId` 但内容不同（digest 不同）的修订**并存并标红为冲突**，谁也不覆盖谁；
+- **冒充防护**：导入先整包校验——digest 必须能由内容重算复现，携带的轮廓哈希必须与
+  参数重算指纹一致；不一致的文件进 `quarantine` 隔离区，绝不冒充同一修订；
+- **原子写入**：修订元数据与轮廓在同一个 IndexedDB readwrite 事务提交，
+  写入体任何同步异常立即 `abort()`，中断只会整体不存在，不留"只含元数据缺轮廓"的半成品；
+  "完整性体检"按钮可扫描既有库并抓出残缺修订；
+- **旧版迁移**：IndexedDB 从 v1 自动升级（`onupgradeneeded` 内同步迁移），
+  旧版单案例变"项目 + 根修订"；旧轮廓指纹对得上才随迁，对不上则丢弃负载、参数照常重建。
+  v1 JSON 文件也可直接导入走同一迁移路径；迁移幂等。
+
+修订 JSON 为自描述 bundle（`kind: 'revision-bundle'`，含项目、修订数组、按 digest 关联的
+轮廓数组）；仅参数导出时省略轮廓数组，导入端按参数确定性重建。
 
 ## 代码结构
 
 ```
-src/geometry/gear.ts    解析尺寸、渐开线齿廓、闭合外环、输入校验
-src/geometry/mesh.ts    装配：啮合角/节圆/侧隙/顶隙/重合度、啮合线、严格啮合相位
-src/geometry/clipper.ts Clipper2 WASM 封装（IntersectD / AreaPathsD）
-src/viewer.ts           Three.js 齿形挤出、参考圆、啮合线/接触点、干涉高亮、运动
-src/store.ts            IndexedDB 与案例 JSON 导入导出（带 schema 版本）
-src/units.ts            显示单位换算（内部恒为 mm）
-src/App.vue             参数面板、检查结果、动画/暂停、案例管理
-scripts/                数值核对（标准齿数与极少齿数样本）
+src/geometry/gear.ts       解析尺寸、渐开线齿廓、闭合外环、输入校验
+src/geometry/mesh.ts       装配：啮合角/节圆/侧隙/顶隙/重合度、啮合线、严格啮合相位
+src/geometry/clipper.ts    Clipper2 WASM 封装（IntersectD / AreaPathsD）
+src/viewer.ts              Three.js 齿形挤出、参考圆、啮合线/接触点、干涉高亮、运动
+src/hash.ts                确定性指纹：canonicalJson + cyrb128（同步，可在 IDB 升级回调中用）
+src/revision-model.ts      修订/快照/检查摘要/轮廓指纹/digest 链、两版 diff、v1 迁移、完整性校验
+src/store.ts               IndexedDB v2（revisions/outlines/projects/quarantine）、
+                           原子事务、DAG/分支/双胞胎、JSON bundle 导入导出、v1 自动升级迁移
+src/revision-db-extras.ts  完整性体检扫描、跨标签页 BroadcastChannel 通知
+src/units.ts               显示单位换算（内部恒为 mm）
+src/App.vue                参数面板、检查结果、动画/暂停、修订历史/分叉/比较/冲突界面
+scripts/                   数值核对 + 修订工作流验收（见下）
 ```
+
+## 测试
+
+- `check-gear.ts`：解析尺寸与齿廓闭合；
+- `check-mesh.ts`：解析啮合、严格相位与转角比；
+- `check-roundtrip.ts`：v2 修订 JSON 往返、幂等去重、Clipper 求交、digest/轮廓篡改拒绝；
+- `check-revisions.ts`：修订工作流验收（基于 fake-indexeddb）——连续两版恢复与几何不变、
+  并发分支保留与比较、重复导入去重/同 ID 冲突双存、v1 迁移后啮合与往返检查、
+  写入与导入中断事务回滚、哈希不一致进隔离、残缺修订体检。

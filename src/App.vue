@@ -1,19 +1,39 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
+import { computed, onMounted, onBeforeUnmount, reactive, ref, shallowRef, watch } from 'vue'
 import { buildGear, validateGearInput, DEG, transformOutline, type GearGeometry, type Pt } from './geometry/gear'
 import { analyzeMesh, gearAnglesAt, mateAngle, type MeshInfo } from './geometry/mesh'
 import { intersectOutlines } from './geometry/clipper'
 import { GearViewer, type ViewerOptions } from './viewer'
 import { UNITS, fromMm, toMm, fmtLen, type LengthUnit } from './units'
 import {
-  type CaseData,
-  downloadJson,
-  listCases,
-  newCaseId,
-  parseCase,
-  saveCase,
-  deleteCase
+  commitRevision,
+  exportProjectBundle,
+  downloadText,
+  importJson,
+  listProjects,
+  listRevisions,
+  getOutlines,
+  deleteProject,
+  deleteHeadRevision,
+  newProjectId,
+  serializeBundle,
+  buildGraph,
+  commonAncestor,
+  type ProjectMeta,
+  type RevisionGraph,
+  type ImportOutcome
 } from './store'
+import {
+  interferenceAtFrame,
+  diffRevisions,
+  expectedOutlines,
+  newTabCreatorId,
+  type InterferenceSnapshot,
+  type Revision,
+  type RevisionDiff,
+  type RevisionParams
+} from './revision-model'
+import { RevisionChannel, scanIntegrity, type IntegrityIssue } from './revision-db-extras'
 
 // ------- 参数（内部全部 mm / 度） -------
 const unit = ref<LengthUnit>('mm')
@@ -132,7 +152,7 @@ onMounted(() => {
       const period = (2 * Math.PI) / g1.value.input.z
       phi1.value = ((phi1.value % period) + period) % period
       // 接触点 s 随 φ1 同步：dφ1/ds = 1/rb1，相位常量按节点对齐
-      const s = (phi1.value - (gearAnglesAt(mesh.value, g1.value, g2.value, 0).phi1)) * g1.value.baseR
+      const s = (phi1.value - gearAnglesAt(mesh.value, g1.value, g2.value, 0).phi1) * g1.value.baseR
       contactS.value = clampS(s)
     }
     if (g1.value && g2.value && mesh.value) {
@@ -191,99 +211,387 @@ function scrubContact() {
   phi1.value = gearAnglesAt(mesh.value, g1.value, g2.value, contactS.value).phi1
 }
 
-// ------- 案例库 -------
-const cases = ref<CaseData[]>([])
-const caseName = ref('未命名案例')
-const caseNote = ref('')
+// =====================================================================
+// 修订与合并工作流（不可变历史 + 分叉 + 冲突检测）
+// =====================================================================
 
-async function refreshCases() {
-  cases.value = await listCases()
+const projects = ref<ProjectMeta[]>([])
+const allRevisions = ref<Revision[]>([])
+const activeProjectId = ref<string | null>(null)
+/** 当前工作所基于的父修订 digest；新实验（无根）为 null */
+const parentDigest = ref<string | null>(null)
+const projectName = ref('未命名实验')
+const revisionNote = ref('')
+const creatorId = newTabCreatorId()
+
+const statusMessages = ref<string[]>([])
+function pushStatus(m: string) {
+  statusMessages.value.unshift(`[${new Date().toLocaleTimeString()}] ${m}`)
+  statusMessages.value = statusMessages.value.slice(0, 8)
 }
-onMounted(refreshCases)
 
-function currentCaseData(withOutlines: boolean): CaseData {
-  const a = mesh.value?.a ?? gearParams.centerDistance
+const graph = computed<RevisionGraph | null>(() =>
+  activeProjectId.value ? buildGraph(allRevisions.value, activeProjectId.value) : null
+)
+
+/** 全库 digest→修订（同 revId 双胞胎可能位于别的实验线，展示冲突要用） */
+const revByDigest = computed(() => {
+  const m = new Map<string, Revision>()
+  for (const r of allRevisions.value) m.set(r.digest, r)
+  return m
+})
+
+/** 当前项目的修订，按链深度/时间排序，含分支标注 */
+const projectRevisions = computed(() => {
+  if (!graph.value) return []
+  return graph.value.order.map((d) => {
+    const n = graph.value!.nodes.get(d)!
+    return {
+      digest: d,
+      node: n,
+      rev: n.rev,
+      depth: n.depth,
+      isHead: n.isHead,
+      isRoot: n.isRoot,
+      // buildGraph 的 twins 已按全库 revId 统计（跨项目双胞胎也能显示）
+      twins: n.twins.map((t) => revByDigest.value.get(t)).filter(Boolean) as Revision[],
+      siblings: n.siblingBranches.map((t) => graph.value!.nodes.get(t)?.rev).filter(Boolean) as Revision[],
+      active: d === parentDigest.value
+    }
+  })
+})
+
+const activeProject = computed(() => projects.value.find((p) => p.id === activeProjectId.value) ?? null)
+
+async function refreshStore() {
+  projects.value = await listProjects()
+  allRevisions.value = await listRevisions()
+  if (activeProjectId.value && !projects.value.some((p) => p.id === activeProjectId.value)) {
+    activeProjectId.value = null
+    parentDigest.value = null
+  }
+}
+
+function currentParams(): RevisionParams {
   return {
-    schemaVersion: 1,
-    id: newCaseId(),
-    name: caseName.value,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    note: caseNote.value,
     gear1: {
-      z: gearParams.z1,
+      z: Math.round(gearParams.z1),
       module: gearParams.m,
-      alpha: gearParams.alphaDeg * DEG,
       alphaDeg: gearParams.alphaDeg,
       faceWidth: gearParams.faceWidth
     },
     gear2: {
-      z: gearParams.z2,
+      z: Math.round(gearParams.z2),
       module: gearParams.m,
-      alpha: gearParams.alphaDeg * DEG,
       alphaDeg: gearParams.alphaDeg,
       faceWidth: gearParams.faceWidth
     },
-    centerDistance: gearParams.useStandardCenter ? null : a,
-    unit: unit.value,
-    outlines:
-      withOutlines && g1.value && g2.value
-        ? { gear1: g1.value.outline, gear2: g2.value.outline }
-        : undefined
+    centerDistance: gearParams.useStandardCenter ? null : gearParams.centerDistance,
+    unit: unit.value
   }
 }
 
-async function saveCurrent(withOutlines: boolean) {
-  await saveCase(currentCaseData(withOutlines))
-  await refreshCases()
+const saveBusy = ref(false)
+
+/**
+ * 保存为新的不可变修订。
+ *  - includeOutlines=true：先在当前帧做 Clipper 干涉，把面积记入检查摘要，并随存轮廓；
+ *  - includeOutlines=false：仅参数修订（轮廓仍可由参数确定性重建）。
+ * 父修订相同时若另一个标签页/导入已写入不同后继，IndexedDB 事务保证双方都保留。
+ */
+async function saveRevisionNow(includeOutlines: boolean) {
+  if (errors.g1.length || errors.g2.length) {
+    alert('参数不合法，无法保存修订')
+    return
+  }
+  saveBusy.value = true
+  try {
+    let interference: InterferenceSnapshot | null = null
+    if (includeOutlines) {
+      interference = await interferenceAtFrame(currentParams(), phi1.value)
+      // 同步画面高亮
+      interferenceArea.value = interference.areaMm2
+    }
+    let pid = activeProjectId.value
+    if (!pid) {
+      pid = newProjectId()
+      activeProjectId.value = pid
+    }
+    const result = await commitRevision({
+      projectId: pid,
+      projectName: projectName.value,
+      parentDigest: parentDigest.value,
+      params: currentParams(),
+      note: revisionNote.value,
+      includeOutlines,
+      interference,
+      creator: creatorId
+    })
+    parentDigest.value = result.revision.digest
+    revisionNote.value = ''
+    await refreshStore()
+    channel?.post({ type: 'committed', projectId: pid, at: Date.now() })
+    if (result.outcome === 'exists') {
+      pushStatus(`内容与已有修订 ${result.revision.revId} 完全相同，未产生重复修订（幂等）`)
+    } else if (result.twins.length > 0) {
+      pushStatus(`⚠ 修订 ID ${result.revision.revId} 已被不同内容占用：双方并列保留（冲突），未覆盖`)
+    } else if (result.branchHeads.length > 1) {
+      pushStatus(`已保存为并列分支（本实验现有 ${result.branchHeads.length} 个 head），可在下方比较`)
+    } else {
+      pushStatus(`已保存修订 ${result.revision.revId}（${includeOutlines ? '含轮廓+当前帧干涉' : '仅参数'}）`)
+    }
+  } catch (e) {
+    alert('保存失败（修订与轮廓在同一事务，未留下半成品）：' + (e as Error).message)
+  } finally {
+    saveBusy.value = false
+  }
 }
 
-function exportCase(withOutlines: boolean) {
-  downloadJson(currentCaseData(withOutlines))
+/** 把某历史修订的参数恢复到工作台；下一次保存即成为它的后继 */
+function checkoutRevision(rev: Revision) {
+  applyParams(rev.params)
+  activeProjectId.value = rev.projectId
+  projectName.value = projects.value.find((p) => p.id === rev.projectId)?.name ?? '实验'
+  parentDigest.value = rev.digest
+  pushStatus(`已恢复修订 ${rev.revId} 的几何；再次保存将从该版本继续（原几何保持不变）`)
 }
 
-async function loadCase(c: CaseData) {
-  gearParams.z1 = c.gear1.z
-  gearParams.z2 = c.gear2.z
-  gearParams.m = c.gear1.module
-  gearParams.alphaDeg = c.gear1.alphaDeg
-  gearParams.faceWidth = c.gear1.faceWidth
-  if (c.centerDistance == null) {
+/** 从任一历史版分叉为一条新的实验线（新项目，根修订记录 fork 来源） */
+const forkBusy = ref(false)
+async function forkFromRevision(rev: Revision) {
+  if (forkBusy.value) return
+  forkBusy.value = true
+  try {
+    applyParams(rev.params)
+    const newPid = newProjectId()
+    const name = `${projects.value.find((p) => p.id === rev.projectId)?.name ?? '实验'} · 分叉自 ${rev.revId.slice(0, 10)}`
+    projectName.value = name
+    activeProjectId.value = newPid
+    // 分叉的新实验线第一个修订：parentDigest=null（另起 DAG），项目元数据记录来源
+    const result = await commitRevision({
+      projectId: newPid,
+      projectName: name,
+      parentDigest: null,
+      params: rev.params,
+      note: `分叉自 ${rev.revId}（${rev.note || '无备注'}）`,
+      includeOutlines: true,
+      interference: rev.checks.interference,
+      creator: creatorId,
+      forkedFrom: { projectId: rev.projectId, digest: rev.digest }
+    })
+    parentDigest.value = result.revision.digest
+    await refreshStore()
+    channel?.post({ type: 'committed', projectId: newPid, at: Date.now() })
+    pushStatus(`已从修订 ${rev.revId} 分叉出新实验线（原实验线完整保留）`)
+  } finally {
+    forkBusy.value = false
+  }
+}
+
+function applyParams(p: RevisionParams) {
+  gearParams.z1 = p.gear1.z
+  gearParams.z2 = p.gear2.z
+  gearParams.m = p.gear1.module
+  gearParams.alphaDeg = p.gear1.alphaDeg
+  gearParams.faceWidth = p.gear1.faceWidth
+  if (p.centerDistance == null) {
     gearParams.useStandardCenter = true
   } else {
     gearParams.useStandardCenter = false
-    gearParams.centerDistance = c.centerDistance
+    gearParams.centerDistance = p.centerDistance
   }
-  unit.value = c.unit || 'mm'
-  caseName.value = c.name
-  caseNote.value = c.note
+  unit.value = p.unit ?? 'mm'
   rebuild()
   if (viewer && g1.value && g2.value && mesh.value) viewer.setGears(g1.value, g2.value, mesh.value.a)
+  phi1.value = 0
+  contactS.value = 0
+  interferenceArea.value = null
+  interferenceRegions.value = []
 }
 
-async function removeCase(id: string) {
-  await deleteCase(id)
-  await refreshCases()
+function selectProject(p: ProjectMeta) {
+  activeProjectId.value = p.id
+  projectName.value = p.name
+  const g = buildGraph(allRevisions.value, p.id)
+  const head = g.heads[0]
+  parentDigest.value = head ?? null
+  if (head) {
+    const rev = g.nodes.get(head)!.rev
+    applyParams(rev.params)
+    revisionNote.value = ''
+  }
 }
 
-function importFile(ev: Event) {
+function newExperiment() {
+  activeProjectId.value = null
+  parentDigest.value = null
+  projectName.value = '未命名实验'
+  revisionNote.value = ''
+  pushStatus('已开始新实验线：下次保存将成为新项目的根修订')
+}
+
+async function removeProject(p: ProjectMeta) {
+  if (!confirm(`删除整个实验线「${p.name}」及其全部修订？此操作不可恢复。`)) return
+  await deleteProject(p.id)
+  if (activeProjectId.value === p.id) {
+    activeProjectId.value = null
+    parentDigest.value = null
+  }
+  await refreshStore()
+  channel?.post({ type: 'deleted', projectId: p.id, at: Date.now() })
+  pushStatus(`已删除实验线 ${p.name}`)
+}
+
+async function removeHead(rev: Revision) {
+  try {
+    await deleteHeadRevision(rev.digest)
+    if (parentDigest.value === rev.digest) parentDigest.value = null
+    await refreshStore()
+    pushStatus(`已删除 head 修订 ${rev.revId}`)
+  } catch (e) {
+    alert((e as Error).message)
+  }
+}
+
+// ------- 导入 / 导出 -------
+async function importFile(ev: Event) {
   const input = ev.target as HTMLInputElement
   const file = input.files?.[0]
   if (!file) return
-  const reader = new FileReader()
-  reader.onload = async () => {
-    try {
-      const c = parseCase(String(reader.result))
-      await saveCase(c)
-      await loadCase(c)
-      await refreshCases()
-    } catch (e) {
-      alert('导入失败：' + (e as Error).message)
+  const text = await file.text()
+  try {
+    const result = await importJson(text)
+    await refreshStore()
+    channel?.post({ type: 'imported', at: Date.now() })
+    for (const o of result.outcomes as ImportOutcome[]) {
+      pushStatus(describeOutcome(o))
+      if ((o.kind === 'imported' || o.kind === 'conflict' || o.kind === 'v1-migrated') && !activeProjectId.value) {
+        activeProjectId.value = o.revision.projectId
+        parentDigest.value = o.revision.digest
+      }
     }
+    if (!activeProjectId.value && result.outcomes[0]) {
+      const o0 = result.outcomes[0]
+      if ('revision' in o0) {
+        activeProjectId.value = o0.revision.projectId
+        parentDigest.value = o0.revision.digest
+      }
+    }
+  } catch (e) {
+    alert('导入失败（未写入任何修订）：' + (e as Error).message)
   }
-  reader.readAsText(file)
   input.value = ''
 }
+
+function describeOutcome(o: ImportOutcome): string {
+  switch (o.kind) {
+    case 'dedup':
+      return `重复导入：修订 ${o.revision.revId} 内容一致，已跳过，不产生副本`
+    case 'imported':
+      return o.message
+    case 'conflict':
+      return `⚠ ${o.message}`
+    case 'v1-migrated':
+      return `旧版案例自动迁移：${o.message}`
+    case 'quarantined':
+      return `✋ ${o.message}`
+  }
+}
+
+async function exportBundle(withOutlines: boolean) {
+  if (!activeProject.value) {
+    alert('请先选择一个实验线')
+    return
+  }
+  try {
+    const bundle = await exportProjectBundle(activeProject.value.id, activeProject.value.name, {
+      includeOutlines: withOutlines
+    })
+    const safe = activeProject.value.name.replace(/[^\w一-龥-]+/g, '_')
+    downloadText(`${safe}.r${bundle.revisions.length}.json`, serializeBundle(bundle))
+    pushStatus(`已导出 ${bundle.revisions.length} 个修订（${withOutlines ? '含轮廓' : '仅参数，轮廓可重建'}）`)
+  } catch (e) {
+    alert('导出中止：' + (e as Error).message)
+  }
+}
+
+// ------- 两版比较 -------
+const compareA = ref<string>('')
+const compareB = ref<string>('')
+const compareDiff = shallowRef<RevisionDiff | null>(null)
+const compareLiveBusy = ref(false)
+
+const comparableRevisions = computed(() =>
+  [...allRevisions.value].sort((a, b) => a.createdAt - b.createdAt)
+)
+
+function runCompare() {
+  const a = allRevisions.value.find((r) => r.digest === compareA.value)
+  const b = allRevisions.value.find((r) => r.digest === compareB.value)
+  compareDiff.value = a && b ? diffRevisions(a, b) : null
+  if (a && b) {
+    const ca = commonAncestor(buildGraph(allRevisions.value), a.digest, b.digest)
+    pushStatus(
+      ca
+        ? `比较 ${a.revId.slice(0, 8)} ↔ ${b.revId.slice(0, 8)}；共同祖先 ${ca.slice(12, 20)}…`
+        : `比较 ${a.revId.slice(0, 8)} ↔ ${b.revId.slice(0, 8)}；两条无共同祖先的实验线`
+    )
+  }
+}
+
+/** 在【同一个当前帧】对两版各做一次 Clipper 求交（轮廓缺失时由参数重建） */
+async function compareLiveFrame() {
+  const a = allRevisions.value.find((r) => r.digest === compareA.value)
+  const b = allRevisions.value.find((r) => r.digest === compareB.value)
+  if (!a || !b) return
+  compareLiveBusy.value = true
+  try {
+    const frame = phi1.value
+    const [ra, rb] = await Promise.all([
+      interferenceAtFrame(a.params, frame, a.hasOutlines ? await outlinesOrNull(a) : null),
+      interferenceAtFrame(b.params, frame, b.hasOutlines ? await outlinesOrNull(b) : null)
+    ])
+    if (compareDiff.value) {
+      compareDiff.value = {
+        ...compareDiff.value,
+        liveInterference: { phi1: frame, a: ra, b: rb, deltaArea: rb.areaMm2 - ra.areaMm2 }
+      }
+    }
+  } finally {
+    compareLiveBusy.value = false
+  }
+}
+
+async function outlinesOrNull(rev: Revision) {
+  const o = await getOutlines(rev.digest)
+  return o ?? expectedOutlines(rev.params)
+}
+
+// ------- 完整性体检 -------
+const integrityIssues = ref<IntegrityIssue[]>([])
+const quarantinedCount = ref(0)
+async function runIntegrityScan() {
+  const r = await scanIntegrity()
+  integrityIssues.value = r.issues
+  quarantinedCount.value = r.quarantined
+  if (!r.issues.length) pushStatus('完整性体检通过：所有修订 digest/轮廓指纹一致，无残缺修订')
+  else pushStatus(`⚠ 发现 ${r.issues.length} 个损坏修订（只含元数据/哈希不符），已在列表中标红`)
+}
+
+// ------- 跨标签页 -------
+let channel: RevisionChannel | null = null
+onMounted(() => {
+  channel = new RevisionChannel(() => {
+    refreshStore()
+    pushStatus('检测到其他标签页的修订变更，已刷新（并列分支/冲突不会被覆盖）')
+  })
+  refreshStore().then(async () => {
+    // 自动选中最近更新的实验线及其 head
+    if (projects.value.length) selectProject(projects.value[0])
+    await runIntegrityScan()
+  })
+})
+onBeforeUnmount(() => channel?.close())
 
 // ------- 派生显示 -------
 const dims = computed(() => {
@@ -306,6 +614,10 @@ function fmt(mm: number) {
   return fmtLen(mm, unit.value)
 }
 
+function fmtTime(t: number) {
+  return new Date(t).toLocaleString()
+}
+
 // 预设样本：标准齿数与极少齿数，便于核对
 function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
   gearParams.z1 = z1
@@ -314,13 +626,33 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
   gearParams.alphaDeg = alphaDeg
   gearParams.useStandardCenter = true
 }
+
+// ------- 比较表展示辅助 -------
+function fmtField(v: number, unit?: string) {
+  if (unit === '°') return `${v.toFixed(3)}°`
+  if (unit === '') return Number.isInteger(v) ? String(v) : v.toFixed(4)
+  return `${v.toFixed(3)} mm`
+}
+function fmtSigned(d: number, unit?: string) {
+  const sign = d > 0 ? '+' : ''
+  if (unit === '°') return `${sign}${d.toFixed(3)}°`
+  if (unit === '') return `${sign}${Number.isInteger(d) ? d : d.toFixed(4)}`
+  return `${sign}${d.toFixed(3)} mm`
+}
+function interfText(s: { areaMm2: number; intersects: boolean } | null) {
+  if (!s) return '未记录'
+  return s.intersects ? `${s.areaMm2.toExponential(2)} mm² ❗` : `${s.areaMm2.toExponential(2)} mm² ✅`
+}
+function interfClass(s: { intersects: boolean } | null) {
+  return s && s.intersects ? 'bad' : 'good'
+}
 </script>
 
 <template>
   <div class="app">
     <header>
-      <h1>直齿圆柱齿轮参数化实验室</h1>
-      <div class="sub">外啮合 · 无变位 · 理想刚性 · 渐开线齿廓（教学模型）</div>
+      <h1>直齿圆柱齿轮参数化实验室 · 修订与合并工作流</h1>
+      <div class="sub">外啮合 · 无变位 · 理想刚性 · 渐开线齿廓（教学模型）｜每次保存为不可变修订，支持分叉、比较与冲突检测</div>
     </header>
 
     <main>
@@ -457,35 +789,150 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
 
       <aside class="panel right">
         <section>
-          <h2>案例（IndexedDB）</h2>
-          <input v-model="caseName" placeholder="案例名称" />
-          <textarea v-model="caseNote" placeholder="备注（可选）" rows="2"></textarea>
-          <div class="row">
-            <button @click="saveCurrent(true)">保存（含轮廓）</button>
-            <button @click="saveCurrent(false)">仅参数</button>
+          <h2>设计修订（不可变历史）</h2>
+          <input v-model="projectName" placeholder="实验线名称" />
+          <textarea v-model="revisionNote" placeholder="本修订备注（可选，会进入修订指纹）" rows="2"></textarea>
+          <div class="basis">
+            基于父修订：
+            <b v-if="parentDigest" :title="parentDigest">{{ parentDigest.slice(0, 16) }}…</b>
+            <b v-else>（新实验线根修订）</b>
           </div>
           <div class="row">
-            <button @click="exportCase(true)">导出 JSON+轮廓</button>
-            <button @click="exportCase(false)">导出参数</button>
+            <button @click="saveRevisionNow(true)" :disabled="saveBusy">保存修订（含轮廓+当前帧干涉）</button>
           </div>
-          <label class="wide filebtn">导入 JSON
+          <div class="row">
+            <button @click="saveRevisionNow(false)" :disabled="saveBusy">仅参数修订</button>
+            <button @click="newExperiment">新实验线</button>
+          </div>
+          <div class="row">
+            <button @click="exportBundle(true)">导出 JSON+轮廓</button>
+            <button @click="exportBundle(false)">导出参数</button>
+          </div>
+          <label class="wide filebtn">导入修订 JSON（v1/v2，自动检测冲突）
             <input type="file" accept="application/json,.json" @change="importFile" hidden />
           </label>
         </section>
+
         <section>
-          <h2>已存案例</h2>
-          <ul class="caselist">
-            <li v-for="c in cases" :key="c.id">
-              <div class="ci">
-                <b>{{ c.name }}</b>
-                <span>{{ c.gear1.z }}/{{ c.gear2.z }} · m={{ c.gear1.module }} · α={{ c.gear1.alphaDeg }}°{{ c.outlines ? ' · 含轮廓' : '' }}</span>
+          <h2>实验线</h2>
+          <ul class="projlist">
+            <li v-for="p in projects" :key="p.id" :class="{ active: p.id === activeProjectId }">
+              <div class="ci" @click="selectProject(p)">
+                <b>{{ p.name }}</b>
+                <span>{{ fmtTime(p.updatedAt) }}<template v-if="p.forkedFromProjectId"> · 🌱 分叉</template></span>
               </div>
-              <div class="ca">
-                <button @click="loadCase(c)">载入</button>
-                <button class="del" @click="removeCase(c.id)">删</button>
+              <button class="del" @click.stop="removeProject(p)">删</button>
+            </li>
+            <li v-if="!projects.length" class="empty">尚无实验线（保存第一条修订即创建）</li>
+          </ul>
+        </section>
+
+        <section v-if="projectRevisions.length">
+          <h2>修订历史（{{ activeProject?.name }}）</h2>
+          <ul class="revlist">
+            <li v-for="r in projectRevisions" :key="r.digest"
+                class="rev"
+                :class="{
+                  head: r.isHead,
+                  root: r.isRoot,
+                  active: r.active,
+                  branch: r.siblings.length > 0,
+                  conflict: r.twins.length > 0
+                }"
+                :style="{ marginLeft: Math.min(r.depth, 6) * 12 + 'px' }">
+              <div class="rev-main">
+                <div>
+                  <b>{{ r.rev.note || r.rev.revId.slice(0, 12) }}</b>
+                  <div class="rev-meta">
+                    {{ r.rev.params.gear1.z }}/{{ r.rev.params.gear2.z }} · m={{ r.rev.params.gear1.module }} · α={{ r.rev.params.gear1.alphaDeg }}°
+                    · a={{ r.rev.checks.a.toFixed(2) }}
+                    <template v-if="r.rev.hasOutlines"> · 轮廓✓</template>
+                    <template v-if="r.rev.checks.interference">
+                      · 帧干涉 {{ r.rev.checks.interference.areaMm2.toExponential(2) }}
+                    </template>
+                  </div>
+                  <div class="rev-tags">
+                    <span v-if="r.isRoot" class="tag root-tag">根</span>
+                    <span v-if="r.isHead" class="tag head-tag">head</span>
+                    <span v-if="r.siblings.length" class="tag branch-tag">⑂ 并列分支 ×{{ r.siblings.length + 1 }}</span>
+                    <span v-for="t in r.twins" :key="t.digest" class="tag conflict-tag">⚠ 同ID不同内容</span>
+                  </div>
+                </div>
+                <div class="rev-actions">
+                  <button @click="checkoutRevision(r.rev)" title="恢复该版几何，下一次保存成为其后继">恢复</button>
+                  <button @click="forkFromRevision(r.rev)" :disabled="forkBusy" title="从此版分叉为新实验线">分叉</button>
+                  <button class="del" @click="removeHead(r.rev)" :disabled="!r.isHead" title="仅可删除 head">删</button>
+                </div>
+              </div>
+              <div v-if="r.twins.length" class="conflict-box">
+                冲突：revId「{{ r.rev.revId }}」存在 {{ r.twins.length + 1 }} 份不同内容，已全部保留。
+                <div v-for="t in r.twins" :key="t.digest">
+                  · {{ t.note || t.digest.slice(0, 16) }}（{{ t.creator }}，{{ fmtTime(t.createdAt) }}）
+                </div>
               </div>
             </li>
-            <li v-if="!cases.length" class="empty">暂无案例</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2>比较两版</h2>
+          <div class="two">
+            <label>A
+              <select v-model="compareA" @change="compareDiff = null">
+                <option value="" disabled>选择修订…</option>
+                <option v-for="r in comparableRevisions" :key="r.digest" :value="r.digest">
+                  {{ r.revId.slice(0, 10) }} · {{ r.params.gear1.z }}/{{ r.params.gear2.z }} · a={{ r.checks.a.toFixed(1) }}
+                </option>
+              </select>
+            </label>
+            <label>B
+              <select v-model="compareB" @change="compareDiff = null">
+                <option value="" disabled>选择修订…</option>
+                <option v-for="r in comparableRevisions" :key="r.digest" :value="r.digest">
+                  {{ r.revId.slice(0, 10) }} · {{ r.params.gear1.z }}/{{ r.params.gear2.z }} · a={{ r.checks.a.toFixed(1) }}
+                </option>
+              </select>
+            </label>
+          </div>
+          <button class="wide" @click="runCompare" :disabled="!compareA || !compareB || compareA === compareB">比较尺寸 / 中心距 / 干涉</button>
+
+          <div v-if="compareDiff" class="diff-box">
+            <div v-if="compareDiff.same" class="good">两版内容完全相同（digest 一致）</div>
+            <table class="diff-table">
+              <thead><tr><th></th><th>A</th><th>B</th><th>Δ(B−A)</th></tr></thead>
+              <tbody>
+                <tr v-for="(f, i) in compareDiff.fields" :key="i" :class="{ changed: Math.abs(f.delta) > 1e-9 }">
+                  <td>{{ f.label }}</td>
+                  <td>{{ fmtField(f.a, f.unit) }}</td>
+                  <td>{{ fmtField(f.b, f.unit) }}</td>
+                  <td :class="f.worse ? 'bad' : ''">{{ fmtSigned(f.delta, f.unit) }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="iface-row">
+              <div>保存时帧干涉 A：<b :class="interfClass(compareDiff.interferenceA)">{{ interfText(compareDiff.interferenceA) }}</b></div>
+              <div>保存时帧干涉 B：<b :class="interfClass(compareDiff.interferenceB)">{{ interfText(compareDiff.interferenceB) }}</b></div>
+            </div>
+            <button class="wide" @click="compareLiveFrame" :disabled="compareLiveBusy">
+              {{ compareLiveBusy ? '求交中…' : `在当前帧（φ₁=${phi1.toFixed(3)}）重放两版干涉` }}
+            </button>
+            <div v-if="compareDiff.liveInterference" class="iface-row">
+              <div>当前帧 A：<b :class="interfClass(compareDiff.liveInterference.a)">{{ interfText(compareDiff.liveInterference.a) }}</b></div>
+              <div>当前帧 B：<b :class="interfClass(compareDiff.liveInterference.b)">{{ interfText(compareDiff.liveInterference.b) }}</b></div>
+              <div>面积差 Δ：<b>{{ compareDiff.liveInterference.deltaArea.toExponential(2) }} mm²</b></div>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h2>完整性 / 状态</h2>
+          <button class="wide" @click="runIntegrityScan">修订库完整性体检</button>
+          <div v-if="quarantinedCount" class="conflict-box">已隔离可疑修订：{{ quarantinedCount }} 条（哈希/digest 不符的导入不会冒充）</div>
+          <div v-for="(iss, i) in integrityIssues" :key="i" class="conflict-box">
+            ⚠ 损坏修订 {{ iss.revId }}：{{ iss.problems.join(', ') }}
+          </div>
+          <ul class="status">
+            <li v-for="(m, i) in statusMessages" :key="i">{{ m }}</li>
           </ul>
         </section>
       </aside>
