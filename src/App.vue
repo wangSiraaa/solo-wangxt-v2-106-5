@@ -1,19 +1,32 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { buildGear, validateGearInput, DEG, transformOutline, type GearGeometry, type Pt } from './geometry/gear'
 import { analyzeMesh, gearAnglesAt, mateAngle, type MeshInfo } from './geometry/mesh'
 import { intersectOutlines } from './geometry/clipper'
 import { GearViewer, type ViewerOptions } from './viewer'
 import { UNITS, fromMm, toMm, fmtLen, type LengthUnit } from './units'
 import {
-  type CaseData,
+  deleteCaseDeep,
   downloadJson,
-  listCases,
-  newCaseId,
-  parseCase,
-  saveCase,
-  deleteCase
+  importCase,
+  listCasesWithHeads,
+  listConflicts,
+  listRevisions,
+  mergeHeads,
+  clearConflict,
+  saveRevision,
+  type CaseWithHeads
 } from './store'
+import {
+  hashOutlines,
+  paramsToGearInput,
+  serializeExport,
+  type CheckSummary,
+  type ConflictRecord,
+  type ParamsSnapshot,
+  type Revision
+} from './revisions'
+import { diffRevisions, interferenceDiff } from './compare'
 
 // ------- 参数（内部全部 mm / 度） -------
 const unit = ref<LengthUnit>('mm')
@@ -86,6 +99,8 @@ const interferenceArea = ref<number | null>(null)
 const interferenceRegions = shallowRef<Pt[][]>([])
 const interferenceBusy = ref(false)
 let interfereReq = 0
+/** 最近一次干涉检查的结论（随修订保存） */
+const lastInterference = shallowRef<CheckSummary['interference']>(null)
 
 async function checkInterference(currentPhi1: number) {
   if (!g1.value || !g2.value || !mesh.value) return
@@ -100,6 +115,7 @@ async function checkInterference(currentPhi1: number) {
     if (req !== interfereReq) return
     interferenceArea.value = res.area
     interferenceRegions.value = res.regions
+    lastInterference.value = { phi1: p1, contactS: contactS.value, area: res.area, regions: res.regions }
   } finally {
     if (req === interfereReq) interferenceBusy.value = false
   }
@@ -162,6 +178,9 @@ function clampS(s: number) {
   return s
 }
 
+// 参数被修改 → 工作状态偏离已载入修订（下次保存将形成新修订）
+const paramsDirty = ref(false)
+
 watch(
   () => [gearParams.z1, gearParams.z2, gearParams.m, gearParams.alphaDeg, gearParams.faceWidth, gearParams.useStandardCenter, gearParams.centerDistance],
   () => {
@@ -171,6 +190,8 @@ watch(
     contactS.value = 0
     interferenceArea.value = null
     interferenceRegions.value = []
+    lastInterference.value = null
+    paramsDirty.value = true
   }
 )
 
@@ -191,91 +212,203 @@ function scrubContact() {
   phi1.value = gearAnglesAt(mesh.value, g1.value, g2.value, contactS.value).phi1
 }
 
-// ------- 案例库 -------
-const cases = ref<CaseData[]>([])
+// ------- 修订工作流（不可变修订 / 分支 / 合并 / 冲突） -------
+const cases = shallowRef<CaseWithHeads[]>([])
+const conflicts = shallowRef<ConflictRecord[]>([])
+const selectedCaseId = ref<string | null>(null)
+const selectedRevisions = shallowRef<Revision[]>([])
 const caseName = ref('未命名案例')
 const caseNote = ref('')
+const saveMsg = ref('')
+/** 当前工作状态所属案例与所基于的修订（下次保存的父修订） */
+const currentCaseId = ref<string | null>(null)
+const currentRevisionId = ref<string | null>(null)
 
-async function refreshCases() {
-  cases.value = await listCases()
+const selectedCase = computed(() => cases.value.find((c) => c.meta.id === selectedCaseId.value) ?? null)
+
+async function refreshCases(keepSelection = true) {
+  cases.value = await listCasesWithHeads()
+  conflicts.value = await listConflicts()
+  if (!keepSelection) selectedCaseId.value = null
+  if (selectedCaseId.value) {
+    if (cases.value.some((c) => c.meta.id === selectedCaseId.value)) {
+      selectedRevisions.value = await listRevisions(selectedCaseId.value)
+    } else {
+      selectedCaseId.value = null
+      selectedRevisions.value = []
+    }
+  }
 }
 onMounted(refreshCases)
 
-function currentCaseData(withOutlines: boolean): CaseData {
-  const a = mesh.value?.a ?? gearParams.centerDistance
+async function selectCase(id: string) {
+  selectedCaseId.value = id
+  selectedRevisions.value = await listRevisions(id)
+  compareAId.value = ''
+  compareBId.value = ''
+  interferenceRecalc.value = null
+}
+
+function currentParamsSnapshot(): ParamsSnapshot {
   return {
-    schemaVersion: 1,
-    id: newCaseId(),
-    name: caseName.value,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    note: caseNote.value,
     gear1: {
-      z: gearParams.z1,
+      z: Math.round(gearParams.z1),
       module: gearParams.m,
       alpha: gearParams.alphaDeg * DEG,
       alphaDeg: gearParams.alphaDeg,
       faceWidth: gearParams.faceWidth
     },
     gear2: {
-      z: gearParams.z2,
+      z: Math.round(gearParams.z2),
       module: gearParams.m,
       alpha: gearParams.alphaDeg * DEG,
       alphaDeg: gearParams.alphaDeg,
       faceWidth: gearParams.faceWidth
     },
-    centerDistance: gearParams.useStandardCenter ? null : a,
-    unit: unit.value,
-    outlines:
-      withOutlines && g1.value && g2.value
-        ? { gear1: g1.value.outline, gear2: g2.value.outline }
-        : undefined
+    centerDistance: gearParams.useStandardCenter ? null : gearParams.centerDistance
   }
 }
 
-async function saveCurrent(withOutlines: boolean) {
-  await saveCase(currentCaseData(withOutlines))
-  await refreshCases()
+function buildCheckSummary(): CheckSummary | null {
+  if (!g1.value || !g2.value || !mesh.value) return null
+  const m = mesh.value
+  return {
+    checkedAt: Date.now(),
+    centerDistance: m.a,
+    standardCenter: m.a0,
+    alphaPrimeDeg: m.alphaPrime / DEG,
+    contactRatio: m.contactRatio,
+    backlashTangential: m.backlashTangential,
+    clearanceMin: Math.min(m.clearance12, m.clearance21),
+    basePitchMatch: m.basePitchMatch,
+    undercut: [g1.value.undercut, g2.value.undercut],
+    warnings: [...m.warnings],
+    interference: lastInterference.value
+  }
 }
 
-function exportCase(withOutlines: boolean) {
-  downloadJson(currentCaseData(withOutlines))
+const shortId = (id: string) => (id.length > 18 ? id.slice(0, 12) + '…' + id.slice(-4) : id)
+const fmtTime = (ts: number) => new Date(ts).toLocaleString()
+
+/** 保存新修订；runCheckFirst=true 时先对当前帧做一次干涉求交再保存 */
+async function saveRevisionNow(runCheckFirst: boolean) {
+  if (!g1.value || !g2.value || !mesh.value) {
+    alert('当前参数不合法，无法保存')
+    return
+  }
+  if (runCheckFirst) await checkInterference(phi1.value)
+  try {
+    const res = await saveRevision({
+      caseId: currentCaseId.value,
+      caseName: caseName.value,
+      unit: unit.value,
+      parentIds: currentRevisionId.value ? [currentRevisionId.value] : [],
+      note: caseNote.value,
+      params: currentParamsSnapshot(),
+      outlines: { gear1: g1.value.outline, gear2: g2.value.outline },
+      check: buildCheckSummary()
+    })
+    currentCaseId.value = res.caseId
+    currentRevisionId.value = res.revision.id
+    paramsDirty.value = false
+    saveMsg.value = res.created
+      ? `已保存修订 ${shortId(res.revision.id)}${res.branched ? '；检测到并行分支（已保留全部头）' : ''}`
+      : `内容与修订 ${shortId(res.revision.id)} 完全相同，未新建`
+    selectedCaseId.value = res.caseId
+    await refreshCases()
+  } catch (e) {
+    alert('保存失败：' + (e as Error).message)
+  }
 }
 
-async function loadCase(c: CaseData) {
-  gearParams.z1 = c.gear1.z
-  gearParams.z2 = c.gear2.z
-  gearParams.m = c.gear1.module
-  gearParams.alphaDeg = c.gear1.alphaDeg
-  gearParams.faceWidth = c.gear1.faceWidth
-  if (c.centerDistance == null) {
+/** 分叉为新案例：以当前工作状态为内容、以当前修订为父，落到一个新案例里 */
+async function forkAsNewCase() {
+  if (!g1.value || !g2.value || !mesh.value) return
+  const parent = currentRevisionId.value
+  currentCaseId.value = null
+  await saveRevisionNow(false)
+  saveMsg.value = `已分叉为新案例（父修订 ${parent ? shortId(parent) : '无'}）`
+}
+
+/** 载入任一历史修订：几何/参数恢复，下次保存即以它为父（分叉实验） */
+async function loadRevision(rev: Revision) {
+  gearParams.z1 = rev.params.gear1.z
+  gearParams.z2 = rev.params.gear2.z
+  gearParams.m = rev.params.gear1.module
+  gearParams.alphaDeg = rev.params.gear1.alphaDeg
+  gearParams.faceWidth = rev.params.gear1.faceWidth
+  if (rev.params.centerDistance == null) {
     gearParams.useStandardCenter = true
   } else {
     gearParams.useStandardCenter = false
-    gearParams.centerDistance = c.centerDistance
+    gearParams.centerDistance = rev.params.centerDistance
   }
-  unit.value = c.unit || 'mm'
-  caseName.value = c.name
-  caseNote.value = c.note
+  caseNote.value = rev.note
+  const meta = cases.value.find((c) => c.meta.id === rev.caseId)?.meta
+  if (meta) {
+    caseName.value = meta.name
+    unit.value = meta.unit
+  }
+  currentCaseId.value = rev.caseId
+  currentRevisionId.value = rev.id
   rebuild()
   if (viewer && g1.value && g2.value && mesh.value) viewer.setGears(g1.value, g2.value, mesh.value.a)
+  // 等参数 watch 刷新完再清除"已修改"标记（watch 是异步的，否则会覆盖）
+  await nextTick()
+  paramsDirty.value = false
+  // 完整性提示：重建几何应与修订指纹一致
+  const okHash =
+    g1.value && g2.value
+      ? hashOutlines({ gear1: g1.value.outline, gear2: g2.value.outline }) === rev.outlineHash
+      : false
+  saveMsg.value = okHash
+    ? `已载入 ${shortId(rev.id)}，几何指纹一致 ✅（修改参数后保存将形成它的后继/分支）`
+    : `已载入 ${shortId(rev.id)}，⚠️ 重建几何与修订指纹不一致（数据可能损坏）`
 }
 
 async function removeCase(id: string) {
-  await deleteCase(id)
+  if (!confirm('删除该案例及其全部修订？此操作不可恢复。')) return
+  await deleteCaseDeep(id)
+  if (currentCaseId.value === id) {
+    currentCaseId.value = null
+    currentRevisionId.value = null
+  }
   await refreshCases()
 }
 
-function importFile(ev: Event) {
+async function exportCase(c: CaseWithHeads) {
+  const revs = await listRevisions(c.meta.id)
+  downloadJson(serializeExport(c.meta, revs), c.meta.name)
+}
+
+async function exportRevision(rev: Revision) {
+  const meta = cases.value.find((c) => c.meta.id === rev.caseId)?.meta
+  downloadJson(
+    serializeExport(meta ?? { id: rev.caseId, name: '导出的修订', unit: unit.value }, [rev]),
+    `修订-${shortId(rev.id)}`
+  )
+}
+
+async function importFile(ev: Event) {
   const input = ev.target as HTMLInputElement
   const file = input.files?.[0]
   if (!file) return
   const reader = new FileReader()
   reader.onload = async () => {
     try {
-      const c = parseCase(String(reader.result))
-      await saveCase(c)
-      await loadCase(c)
+      const rep = await importCase(String(reader.result))
+      if (!rep.ok) {
+        saveMsg.value = `导入被拒绝：${rep.error}`
+        alert('导入失败：' + rep.error)
+      } else {
+        const parts = [`新存 ${rep.stored.length} 个修订`]
+        if (rep.duplicates.length) parts.push(`${rep.duplicates.length} 个重复已去重`)
+        if (rep.conflicts.length) parts.push(`⚠️ ${rep.conflicts.length} 个冲突（见下方冲突列表）`)
+        if (rep.migratedFromV1) parts.push('旧版案例已自动迁移')
+        if (rep.rebuiltOutlines) parts.push(`${rep.rebuiltOutlines} 个修订的轮廓由参数重建`)
+        saveMsg.value = '导入完成：' + parts.join('，')
+        if (rep.caseId) selectedCaseId.value = rep.caseId
+      }
       await refreshCases()
     } catch (e) {
       alert('导入失败：' + (e as Error).message)
@@ -283,6 +416,68 @@ function importFile(ev: Event) {
   }
   reader.readAsText(file)
   input.value = ''
+}
+
+async function dismissConflict(id: number) {
+  await clearConflict(id)
+  conflicts.value = await listConflicts()
+}
+
+// ------- 分支合并 -------
+const mergeBaseId = ref('')
+const mergeNote = ref('')
+
+async function doMerge() {
+  if (!selectedCaseId.value || !mergeBaseId.value) return
+  try {
+    const res = await mergeHeads(selectedCaseId.value, mergeBaseId.value, mergeNote.value)
+    saveMsg.value = `已合并为修订 ${shortId(res.revision.id)}，分支收敛为单头`
+    mergeBaseId.value = ''
+    mergeNote.value = ''
+    await refreshCases()
+  } catch (e) {
+    alert('合并失败：' + (e as Error).message)
+  }
+}
+
+// ------- 修订对比 -------
+const compareAId = ref('')
+const compareBId = ref('')
+const interferenceRecalc = shallowRef<{ a: number; b: number } | null>(null)
+const recalcBusy = ref(false)
+
+const compareA = computed(() => selectedRevisions.value.find((r) => r.id === compareAId.value) ?? null)
+const compareB = computed(() => selectedRevisions.value.find((r) => r.id === compareBId.value) ?? null)
+
+const compareRows = computed(() => (compareA.value && compareB.value ? diffRevisions(compareA.value, compareB.value) : []))
+const compareInterference = computed(() =>
+  compareA.value && compareB.value ? interferenceDiff(compareA.value, compareB.value) : null
+)
+
+/** 以当前接触点 s 重新计算两版干涉（用各自保存的轮廓，几何不可变） */
+async function recalcInterference() {
+  if (!compareA.value || !compareB.value || !mesh.value) return
+  recalcBusy.value = true
+  interferenceRecalc.value = null
+  try {
+    const run = async (rev: Revision) => {
+      const ga = buildGear(paramsToGearInput(rev.params.gear1))
+      const gb = buildGear(paramsToGearInput(rev.params.gear2))
+      const a = rev.params.centerDistance ?? ga.pitchR + gb.pitchR
+      const m = analyzeMesh({ g1: ga, g2: gb, centerDistance: a })
+      const p1 = gearAnglesAt(m, ga, gb, contactS.value).phi1
+      const p2 = mateAngle(ga, gb, m, p1)
+      const res = await intersectOutlines(
+        [transformOutline(rev.outlines.gear1, 0, 0, p1)],
+        [transformOutline(rev.outlines.gear2, a, 0, p2)]
+      )
+      return res.area
+    }
+    const [a, b] = await Promise.all([run(compareA.value), run(compareB.value)])
+    interferenceRecalc.value = { a, b }
+  } finally {
+    recalcBusy.value = false
+  }
 }
 
 // ------- 派生显示 -------
@@ -306,6 +501,15 @@ function fmt(mm: number) {
   return fmtLen(mm, unit.value)
 }
 
+/** 对比表数值格式化（mm 量随显示单位换算） */
+function fmtDiff(v: number | string) {
+  return typeof v === 'number' ? fmt(v) : v
+}
+
+function revisionLabel(r: Revision) {
+  return `${shortId(r.id)} · ${r.params.gear1.z}/${r.params.gear2.z} m=${r.params.gear1.module} · ${fmtTime(r.createdAt)}`
+}
+
 // 预设样本：标准齿数与极少齿数，便于核对
 function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
   gearParams.z1 = z1
@@ -320,7 +524,7 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
   <div class="app">
     <header>
       <h1>直齿圆柱齿轮参数化实验室</h1>
-      <div class="sub">外啮合 · 无变位 · 理想刚性 · 渐开线齿廓（教学模型）</div>
+      <div class="sub">外啮合 · 无变位 · 理想刚性 · 渐开线齿廓（教学模型）· 不可变修订</div>
     </header>
 
     <main>
@@ -457,36 +661,157 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
 
       <aside class="panel right">
         <section>
-          <h2>案例（IndexedDB）</h2>
+          <h2>保存修订（不可变）</h2>
           <input v-model="caseName" placeholder="案例名称" />
-          <textarea v-model="caseNote" placeholder="备注（可选）" rows="2"></textarea>
+          <textarea v-model="caseNote" placeholder="本次修订备注（可选）" rows="2"></textarea>
           <div class="row">
-            <button @click="saveCurrent(true)">保存（含轮廓）</button>
-            <button @click="saveCurrent(false)">仅参数</button>
+            <button @click="saveRevisionNow(false)">保存新修订</button>
+            <button @click="saveRevisionNow(true)" :disabled="interferenceBusy">干涉检查后保存</button>
           </div>
           <div class="row">
-            <button @click="exportCase(true)">导出 JSON+轮廓</button>
-            <button @click="exportCase(false)">导出参数</button>
+            <button @click="forkAsNewCase" title="以当前修订为父，把当前工作状态存到一个新案例">另存为新案例（分叉）</button>
           </div>
-          <label class="wide filebtn">导入 JSON
-            <input type="file" accept="application/json,.json" @change="importFile" hidden />
-          </label>
+          <div class="row">
+            <label class="wide filebtn">导入 JSON（v1 旧案例自动迁移）
+              <input type="file" accept="application/json,.json" @change="importFile" hidden />
+            </label>
+          </div>
+          <div class="revstate">
+            <template v-if="currentRevisionId">
+              当前基于 <code>{{ shortId(currentRevisionId) }}</code>
+              <span v-if="paramsDirty" class="bad">· 参数已修改（保存将产生新修订）</span>
+              <span v-else class="good">· 与已存修订一致</span>
+            </template>
+            <template v-else>尚未保存：首次保存将创建新案例与根修订</template>
+          </div>
+          <div v-if="saveMsg" class="report">{{ saveMsg }}</div>
         </section>
-        <section>
-          <h2>已存案例</h2>
+
+        <section v-if="conflicts.length">
+          <h2>⚠️ 导入冲突（{{ conflicts.length }}）</h2>
           <ul class="caselist">
-            <li v-for="c in cases" :key="c.id">
+            <li v-for="c in conflicts" :key="c.id">
               <div class="ci">
-                <b>{{ c.name }}</b>
-                <span>{{ c.gear1.z }}/{{ c.gear2.z }} · m={{ c.gear1.module }} · α={{ c.gear1.alphaDeg }}°{{ c.outlines ? ' · 含轮廓' : '' }}</span>
+                <b>{{ c.type === 'id-mismatch' ? '修订 id 与内容不符' : '轮廓指纹不一致' }}</b>
+                <span>{{ c.detail }}</span>
+                <span class="dim">{{ fmtTime(c.detectedAt) }}</span>
+              </div>
+              <div class="ca"><button class="del" @click="dismissConflict(c.id!)">知道了</button></div>
+            </li>
+          </ul>
+        </section>
+
+        <section>
+          <h2>案例库</h2>
+          <ul class="caselist">
+            <li v-for="c in cases" :key="c.meta.id" :class="{ selected: c.meta.id === selectedCaseId }">
+              <div class="ci clickable" @click="selectCase(c.meta.id)">
+                <b>{{ c.meta.name }}</b>
+                <span>
+                  {{ c.revisionCount }} 个修订
+                  <template v-if="c.meta.headIds.length > 1"> · <b class="bad">🔀 {{ c.meta.headIds.length }} 个并行分支</b></template>
+                </span>
               </div>
               <div class="ca">
-                <button @click="loadCase(c)">载入</button>
-                <button class="del" @click="removeCase(c.id)">删</button>
+                <button v-if="c.heads.length" @click="loadRevision(c.heads[c.heads.length - 1])" title="载入最新分支头">载入</button>
+                <button @click="exportCase(c)" title="导出全部修订为 JSON">导出</button>
+                <button class="del" @click="removeCase(c.meta.id)">删</button>
               </div>
             </li>
             <li v-if="!cases.length" class="empty">暂无案例</li>
           </ul>
+        </section>
+
+        <section v-if="selectedCase">
+          <h2>修订历史（{{ selectedRevisions.length }}）</h2>
+          <div v-if="selectedCase.meta.headIds.length > 1" class="report branchbox">
+            🔀 该案例有 {{ selectedCase.meta.headIds.length }} 个并行分支头（来自并发保存或导入），均已保留。
+            <div class="row">
+              <select v-model="mergeBaseId">
+                <option value="" disabled>选择合并后采用的内容…</option>
+                <option v-for="h in selectedCase.heads" :key="h.id" :value="h.id">{{ revisionLabel(h) }}</option>
+              </select>
+            </div>
+            <input v-model="mergeNote" placeholder="合并备注（可选）" />
+            <button class="wide" :disabled="!mergeBaseId" @click="doMerge">合并分支（保留全部历史）</button>
+          </div>
+          <ul class="revlist">
+            <li v-for="r in [...selectedRevisions].reverse()" :key="r.id" :class="{ current: r.id === currentRevisionId }">
+              <div class="rv-head">
+                <code>{{ shortId(r.id) }}</code>
+                <span class="badges">
+                  <b v-if="selectedCase.meta.headIds.includes(r.id)" class="badge head">头</b>
+                  <b v-if="r.id === currentRevisionId" class="badge cur">当前</b>
+                  <b v-if="r.parentIds.length > 1" class="badge merge">合并</b>
+                  <b v-if="r.parentIds.length === 0" class="badge">根</b>
+                  <b v-if="r.migratedFrom" class="badge">v{{ r.migratedFrom }}迁移</b>
+                </span>
+              </div>
+              <div class="rv-meta">
+                {{ fmtTime(r.createdAt) }} · z {{ r.params.gear1.z }}/{{ r.params.gear2.z }} · m={{ r.params.gear1.module }} · α={{ r.params.gear1.alphaDeg }}°
+                · a={{ r.params.centerDistance == null ? '标准' : fmt(r.params.centerDistance) }}
+              </div>
+              <div class="rv-meta" v-if="r.check">
+                检查：ε={{ r.check.contactRatio.toFixed(3) }}，j_t={{ fmt(r.check.backlashTangential) }}
+                <template v-if="r.check.interference">
+                  · 干涉面积 <b :class="r.check.interference.area > 1e-6 ? 'bad' : 'good'">{{ r.check.interference.area.toExponential(2) }} mm²</b>
+                </template>
+                <template v-else> · 未做干涉求交</template>
+              </div>
+              <div class="rv-meta note" v-if="r.note">📝 {{ r.note }}</div>
+              <div class="rv-meta dim">
+                父：<template v-if="r.parentIds.length">{{ r.parentIds.map(shortId).join('、') }}</template><template v-else>（根修订）</template>
+              </div>
+              <div class="ca">
+                <button @click="loadRevision(r)" title="载入该修订；之后保存即以它为父（分叉实验）">载入/分叉</button>
+                <button @click="compareAId = r.id" :class="{ active: compareAId === r.id }">对比A</button>
+                <button @click="compareBId = r.id" :class="{ active: compareBId === r.id }">对比B</button>
+                <button @click="exportRevision(r)" title="仅导出此修订">导出</button>
+              </div>
+            </li>
+          </ul>
+        </section>
+
+        <section v-if="compareA && compareB">
+          <h2>修订对比</h2>
+          <div class="rv-meta dim">A = {{ revisionLabel(compareA) }}</div>
+          <div class="rv-meta dim">B = {{ revisionLabel(compareB) }}</div>
+          <table class="difftable">
+            <thead><tr><th>项目</th><th>A</th><th>B</th><th>Δ(B−A)</th></tr></thead>
+            <tbody>
+              <tr v-for="row in compareRows" :key="row.label" :class="{ changed: row.changed }">
+                <td>{{ row.label }}</td>
+                <td>{{ fmtDiff(row.a) }}</td>
+                <td>{{ fmtDiff(row.b) }}</td>
+                <td>{{ row.delta !== null ? fmtDiff(row.delta) : (row.changed ? '不同' : '—') }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="report">
+            <div>保存时的干涉结论：</div>
+            <div>A：
+              <template v-if="compareInterference?.a">面积 {{ compareInterference.a.area.toExponential(3) }} mm²（φ₁={{ compareInterference.a.phi1.toFixed(3) }}）</template>
+              <template v-else>未做求交</template>
+            </div>
+            <div>B：
+              <template v-if="compareInterference?.b">面积 {{ compareInterference.b.area.toExponential(3) }} mm²（φ₁={{ compareInterference.b.phi1.toFixed(3) }}）</template>
+              <template v-else>未做求交</template>
+            </div>
+            <div v-if="compareInterference?.deltaArea !== null && compareInterference?.deltaArea !== undefined">
+              Δ面积 = {{ compareInterference.deltaArea.toExponential(3) }} mm²
+            </div>
+          </div>
+          <button class="wide" :disabled="recalcBusy" @click="recalcInterference">
+            {{ recalcBusy ? '求交中…' : `以当前接触点 s=${contactS.toFixed(2)} mm 重算两版干涉` }}
+          </button>
+          <div v-if="interferenceRecalc" class="report">
+            当前帧重算（用各自保存的轮廓）：<br />
+            A：{{ interferenceRecalc.a.toExponential(3) }} mm²
+            <b :class="interferenceRecalc.a > 1e-6 ? 'bad' : 'good'">{{ interferenceRecalc.a > 1e-6 ? '干涉' : '无干涉' }}</b><br />
+            B：{{ interferenceRecalc.b.toExponential(3) }} mm²
+            <b :class="interferenceRecalc.b > 1e-6 ? 'bad' : 'good'">{{ interferenceRecalc.b > 1e-6 ? '干涉' : '无干涉' }}</b><br />
+            Δ = {{ (interferenceRecalc.b - interferenceRecalc.a).toExponential(3) }} mm²
+          </div>
         </section>
       </aside>
     </main>
